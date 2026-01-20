@@ -1,0 +1,173 @@
+# ================================
+# 0. Install / Import Libraries
+# ================================
+!pip install rasterio geopandas matplotlib contextily -q
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import rasterio
+import geopandas as gpd
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from google.colab import drive
+import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
+import contextily as ctx            # <‑‑ NEW
+
+# ================================
+# 1. Mount Google Drive
+# ================================
+drive.mount("/content/drive")
+
+# ================================
+# 2. Set Folder Paths
+# ================================
+ba_sum_folder = "/content/drive/MyDrive/BA_monthly_sum"
+ba_folder     = "/content/drive/MyDrive/BA_tifs"   # Europe_27.shp is here
+os.makedirs(ba_sum_folder, exist_ok=True)
+
+# ================================
+# 3. Load summed monthly rasters
+# ================================
+monthly_sum = {}
+meta0 = crs0 = transform0 = bounds0 = width0 = height0 = None
+
+for m in range(1, 13):
+    fn = f"Sum_BA_2001_2020_M{m:02d}.tif"
+    path = os.path.join(ba_sum_folder, fn)
+
+    if os.path.exists(path):
+        with rasterio.open(path) as src:
+            arr = src.read(1, masked=True).filled(0)
+            monthly_sum[m] = arr
+            if meta0 is None:                        # capture geoinfo once
+                meta0, crs0 = src.meta.copy(), src.crs
+                transform0  = src.transform
+                bounds0     = src.bounds
+                width0      = src.width
+                height0     = src.height
+    else:
+        print(f"⚠️ Missing raster: {path}")
+
+# ================================
+# 4. Load & reproject EU‑27 shapefile
+# ================================
+eu27     = gpd.read_file(os.path.join(ba_folder, "Europe_27.shp"))
+eu27_wgs = eu27.to_crs(epsg=4326)                    # WGS‑84
+
+# ================================
+# 5. Helper: reproject raster to WGS‑84
+# ================================
+def to_wgs84(src_arr):
+    dst_crs = "EPSG:4326"
+    dst_aff, dst_w, dst_h = calculate_default_transform(
+        crs0, dst_crs, width0, height0,
+        left=bounds0.left, bottom=bounds0.bottom,
+        right=bounds0.right, top=bounds0.top)
+
+    dst_arr = np.zeros((dst_h, dst_w), dtype=np.float32)
+    reproject(
+        source      = src_arr,
+        destination = dst_arr,
+        src_transform = transform0,
+        src_crs       = crs0,
+        dst_transform = dst_aff,
+        dst_crs       = dst_crs,
+        resampling    = Resampling.nearest
+    )
+    return dst_arr, dst_aff
+
+month_wgs, aff_wgs = {}, {}
+for m, arr in monthly_sum.items():
+    month_wgs[m], aff_wgs[m] = to_wgs84(arr)
+
+# ================================
+# 6. Burned‑area colour map
+# ================================
+bounds = [0, 10, 30, 100, 200, 400, np.inf]
+#colors = ['white', '#90ee90', '#ffff00', '#ffa500', '#ff7f7f', '#ff0000']
+colors = ['white', '#f8daf5', '#ffff00', '#ffa500', '#ff7f7f', '#ff0000']
+cmap   = mcolors.ListedColormap(colors)
+norm   = mcolors.BoundaryNorm(bounds, cmap.N)
+
+# ================================
+# 7. Plot 12 monthly maps
+# ================================
+fig, axes = plt.subplots(3, 4, figsize=(20, 12), constrained_layout=True)
+fig.subplots_adjust(right=0.85)        # leave space for legend
+
+months = ["Jan.", "Feb.", "Mar.", "Apr.", "May.", "Jun.",
+          "Jul.", "Aug.", "Sep.", "Oct.", "Nov.", "Dec."]
+
+for i, ax in enumerate(axes.ravel(), 1):
+    if i not in month_wgs:
+        ax.axis("off")
+        continue
+
+    arr = month_wgs[i]
+    aff = aff_wgs[i]
+    masked = np.ma.masked_less_equal(arr, 0)
+
+    # ----------  order: basemap (z=0) → EU (z=1) → raster (z=2) ----------
+    # Set spatial extent first
+    extent = [aff[2], aff[2] + arr.shape[1]*aff[0],
+              aff[5] + arr.shape[0]*aff[4], aff[5]]
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+
+    # 1️⃣ add basemap
+    ctx.add_basemap(ax,
+        crs="EPSG:4326",
+        source=ctx.providers.CartoDB.Positron,
+        zorder=0)
+
+    # 2️⃣ draw EU‑27 polygons
+    eu27_wgs.plot(ax=ax,
+        color="#b0b0b0", edgecolor="black",
+        linewidth=0.7, zorder=1)
+
+    # 3️⃣ burned‑area raster
+    ax.imshow(masked, cmap=cmap, norm=norm,
+              extent=extent, origin='upper',
+              interpolation='nearest', alpha=0.7,
+              zorder=2)
+
+    # Title right‑aligned
+    ax.set_title(months[i-1], fontsize=18, weight="bold",
+                 loc="right", pad=6)
+    ax.axis("off")
+
+    # frame
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_edgecolor("black")
+        spine.set_linewidth(1)
+
+# ================================
+# 8. Legend
+# ================================
+leg_labels = ['≤ 10', '10 – 30', '30 – 100', '100 – 200', '200 – 400', '> 400']
+patches = [mpatches.Patch(color=c, label=l) for c, l in zip(colors, leg_labels)]
+
+legend = fig.legend(
+    handles       = patches,
+    loc           = 'center left',
+    bbox_to_anchor= (1.02, 0.5),
+    borderaxespad = 0.5,
+    fontsize      = 18,          # label size
+    title         = "Burned Area [ha]",
+    title_fontsize= 20
+)
+
+# Make legend frame visible and bold
+legend.get_frame().set_linewidth(1.5)    # thicker frame
+legend.get_frame().set_edgecolor('black')  # black frame
+
+# ================================
+# 9. Save / Show
+# ================================
+out_png = os.path.join(ba_sum_folder, "Monthly_BA_EU27_2001_2020_basemap.png")
+fig.savefig(out_png, dpi=300, bbox_inches="tight")
+print(f"✅ Figure saved to: {out_png}")
+
+plt.show()
